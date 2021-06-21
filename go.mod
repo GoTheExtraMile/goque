@@ -1,4 +1,4 @@
-module goque
+module github.com/GoTheExtraMile/goque
 
 go 1.13
 

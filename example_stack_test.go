@@ -3,7 +3,7 @@ package goque_test
 import (
 	"fmt"
 
-	"goque"
+	"github.com/GoTheExtraMile/goque"
 )
 
 // ExampleStack demonstrates the implementation of a Goque stack.
