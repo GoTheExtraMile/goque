@@ -153,6 +153,64 @@ func (pq *PrefixQueue) EnqueueObjectAsJSON(prefix []byte, value interface{}) (*I
 	return pq.Enqueue(prefix, jsonBytes)
 }
 
+//===删除指定id的item
+func (pq *PrefixQueue) DequeueById(key []byte) (*Item, error) {
+	pq.Lock()
+	defer pq.Unlock()
+
+	// Check if queue is closed.
+	if !pq.isOpen {
+		return nil, ErrDBClosed
+	}
+
+	//从key解析出prefix和id
+	prefix, id, err := getPrefixAndIdByKey(key)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get the queue for this prefix.
+	q, err := pq.getQueue(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// Try to get the next item in the queue.
+	item, err := pq.getItemByPrefixID(prefix, id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Remove this item from the queue.
+	if err := pq.db.Delete(item.Key, nil); err != nil {
+		return nil, err
+	}
+
+	// Increment head position and decrement prefix queue size.
+	//如果删除的就是下一个，头加1
+	if q.Head+1 == id {
+		q.Head++
+	} else {
+		//保存非顺序删除的id
+		if err := pq.db.Put(append(generateKeyPrefixID(prefix, id), 'd' ), nil, nil); err != nil {
+			return nil, err
+		}
+	}
+	pq.size--
+
+	// Save the queue.
+	if err := pq.saveQueue(prefix, q); err != nil {
+		return nil, err
+	}
+
+	// Save main prefix queue data.
+	if err := pq.save(); err != nil {
+		return nil, err
+	}
+
+	return item, nil
+}
+
 // Dequeue removes the next item in the prefix queue and returns it.
 func (pq *PrefixQueue) Dequeue(prefix []byte) (*Item, error) {
 	pq.Lock()
@@ -170,7 +228,7 @@ func (pq *PrefixQueue) Dequeue(prefix []byte) (*Item, error) {
 	}
 
 	// Try to get the next item in the queue.
-	item, err := pq.getItemByPrefixID(prefix, q.Head+1)
+	item, err := pq.getItemByPrefixID_V2(prefix, q.Head+1, false)
 	if err != nil {
 		return nil, err
 	}
@@ -181,8 +239,8 @@ func (pq *PrefixQueue) Dequeue(prefix []byte) (*Item, error) {
 	}
 
 	// Increment head position and decrement prefix queue size.
-	q.Head++
 	pq.size--
+	q.Head = item.ID
 
 	// Save the queue.
 	if err := pq.saveQueue(prefix, q); err != nil {
@@ -239,6 +297,18 @@ func (pq *PrefixQueue) PeekByID(prefix []byte, id uint64) (*Item, error) {
 	}
 
 	return pq.getItemByPrefixID(prefix, id)
+}
+
+func (pq *PrefixQueue) PeekByID_V2(prefix []byte, id uint64) (*Item, error) {
+	pq.RLock()
+	defer pq.RUnlock()
+
+	// Check if queue is closed.
+	if !pq.isOpen {
+		return nil, ErrDBClosed
+	}
+
+	return pq.getItemByPrefixID_V2(prefix, id, true)
 }
 
 // PeekByIDString is a helper function for Peek that accepts the prefix as a
@@ -423,6 +493,7 @@ func (pq *PrefixQueue) getDataKey() []byte {
 }
 
 // getItemByPrefixID returns an item, if found, for the given prefix and ID.
+//跳跃删除使用，无需跳空，空返回错误
 func (pq *PrefixQueue) getItemByPrefixID(prefix []byte, id uint64) (*Item, error) {
 	// Check if empty.
 	if pq.size == 0 {
@@ -453,6 +524,60 @@ func (pq *PrefixQueue) getItemByPrefixID(prefix []byte, id uint64) (*Item, error
 	return item, nil
 }
 
+//正常按序pop时使用，包含跳空逻辑
+func (pq *PrefixQueue) getItemByPrefixID_V2(prefix []byte, id uint64, isPeek bool) (*Item, error) {
+	// Check if empty.
+	if pq.size == 0 {
+		return nil, ErrEmpty
+	}
+
+	// Get the queue for this prefix.
+	q, err := pq.getQueue(prefix)
+	if err != nil {
+		return nil, err
+	}
+
+	// Check if out of bounds.
+	if id <= q.Head || id > q.Tail {
+		return nil, ErrOutOfBounds
+	}
+
+	var itemValue []byte
+	if itemValue, err = pq.db.Get(generateKeyPrefixID(prefix, id), nil); err != nil {
+		//如果err原因不是notFound直接返回err
+		if err != errors.ErrNotFound {
+			return nil, err
+		}
+
+		delMarkKey := append(generateKeyPrefixID(prefix, id), 'd' )
+		_, err := pq.db.Get(delMarkKey, nil)
+		if err != nil {
+			return nil, err
+		}
+		//如果不是查看，清除删除标记
+		if !isPeek {
+			err = pq.db.Delete(delMarkKey, nil)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		//如果err为空说明这个id的item之前就被删除了，id自增，递归到下一个
+		id++
+		return pq.getItemByPrefixID_V2(prefix, id, isPeek)
+	}
+
+	item := &Item{
+		ID:  id,
+		Key: generateKeyPrefixID(prefix, id),
+		Value: itemValue,
+	}
+
+	return item, nil
+}
+
+
+
 // init initializes the prefix queue data.
 func (pq *PrefixQueue) init() error {
 	// Get the main prefix queue data.
@@ -482,4 +607,15 @@ func generateKeyPrefixID(prefix []byte, id uint64) []byte {
 	key = append(key, idToKey(id)...)
 
 	return key
+}
+
+func getPrefixAndIdByKey(key []byte) ([]byte, uint64, error) {
+
+	l := bytes.Split(key, []byte{prefixDelimiter})
+	prexfix := l[0]
+	//加一位过滤掉分隔符prefixDelimiter
+	index := len(prexfix) + 1
+	id := key[index:]
+
+	return prexfix, keyToID(id), nil
 }
