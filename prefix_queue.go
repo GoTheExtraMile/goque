@@ -153,6 +153,14 @@ func (pq *PrefixQueue) EnqueueObjectAsJSON(prefix []byte, value interface{}) (*I
 	return pq.Enqueue(prefix, jsonBytes)
 }
 
+func (pq *PrefixQueue) GetPrefixByKey(key []byte) (string, error) {
+	prefix, _, err := getPrefixAndIdByKey(key)
+	if err != nil {
+		return "", err
+	}
+	return string(prefix), nil
+}
+
 //===删除指定id的item
 func (pq *PrefixQueue) DequeueById(key []byte) (*Item, error) {
 	pq.Lock()
