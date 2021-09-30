@@ -285,7 +285,7 @@ func (pq *PrefixQueue) Peek(prefix []byte) (*Item, error) {
 		return nil, err
 	}
 
-	return pq.getItemByPrefixID(prefix, q.Head+1)
+	return pq.getItemByPrefixID_V2(prefix, q.Head+1, true)
 }
 
 // PeekString is a helper function for Peek that accepts the prefix as a
